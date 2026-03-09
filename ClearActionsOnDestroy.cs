@@ -1,16 +1,17 @@
-
+﻿
 using UnityEngine;
 using ZEventSystem;
 
 public class ClearActionsOnDestroy : MonoBehaviour
 {
-    string key;
+    private IListener _listener;
     private void OnDestroy()
     {
-        EventCenter.ClearGameObjectActions(key);
+        // 清掉该 listener 注册过的所有事件（O(注册数)）
+        _listener?.RemoveALL_ThisObjListenter();
     }
-    public void OnInit(string key)
+    public void OnInit(IListener listener)
     {
-        this.key = key;
+        _listener = listener;
     }
 }

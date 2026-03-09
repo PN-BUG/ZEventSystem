@@ -1,424 +1,1193 @@
+﻿// EventCenter.cs (Full Version)
+// - O(1) trigger via combined delegate (no DynamicInvoke)
+// - Supports: string eventName, enum eventName, IEventInfo type eventName
+// - Supports: Add/Remove (precise), RemoveOne (remove all handlers by listener for one event), RemoveALL (remove all registrations)
+// - Supports: TR (query) one-to-one by signature/eventName
+// - Clear() truly clears all generic tables actually used (no need to list signatures)
+// - Enum->string key cached (fast, supports any enum underlying type)
+// NOTE: Enum key format: "{EnumType.FullName}.{EnumValueName}"
+
 using System;
 using System.Collections.Generic;
-using System.Linq;
 using UnityEngine;
 using UnityEngine.Events;
+#if UNITY_EDITOR
+using UnityEditor;
+#endif
+
 namespace ZEventSystem
 {
+    public interface IEventInfo { }
+
+    public interface IOnlyOneID { int Rid { get; set; } }
+
     public interface IListener
     {
         string ListenerName
         {
             get
             {
-                if (this is IOnlyOneID)
-                    return GetType().Name + (this as IOnlyOneID).GetID();
-                else return GetType().Name;
+                if (this is IOnlyOneID one) return GetType().Name + one.GetID();
+                return GetType().Name;
             }
         }
     }
-    public interface IOnlyOneID
+
+    #region OnlyOneID Pool (Unity-friendly)
+    internal static class OnlyOneIdPool
     {
-        static SortedSet<int> UseIDList = new SortedSet<int>();
-        static Queue<int> UnUseIDList = new Queue<int>(); // 先进先出
-        int Rid { get; set; }
+        private static readonly object _lockObj = new object();
+        private static readonly SortedSet<int> _used = new SortedSet<int>();
+        private static readonly Queue<int> _unused = new Queue<int>();
 
         public static void Clear()
         {
-            UseIDList = new();
-            UnUseIDList = new();
+            lock (_lockObj)
+            {
+                _used.Clear();
+                _unused.Clear();
+            }
         }
-    }
 
-    #region  结构体类型事件封装  演示
-    public struct IdChangeEvent : IEventInfo { public int a; }
-    public struct IdChangeEvent<T> : IEventInfo
-    {
-        public int a;
-        public UnityAction<T> actions;
-        public IdChangeEvent(int a, UnityAction<T> action)
+        public static int Init(IOnlyOneID self)
         {
-            this.a = a;
-            actions = action;
+            lock (_lockObj)
+            {
+                Release(self);
+
+                int id = _unused.Count > 0 ? _unused.Dequeue() : (_used.Count > 0 ? _used.Max + 1 : 1);
+                self.Rid = id;
+                _used.Add(id);
+                return id;
+            }
+        }
+
+        public static int Get(IOnlyOneID self) => self.Rid != 0 ? self.Rid : Init(self);
+
+        public static void Release(IOnlyOneID self)
+        {
+            if (self == null || self.Rid == 0) return;
+            lock (_lockObj)
+            {
+                int id = self.Rid;
+                if (_used.Remove(id)) _unused.Enqueue(id);
+                self.Rid = 0;
+            }
         }
     }
-    public struct NewSceneEvent : IEventInfo { }
 
-    public struct HideTipsEvent : IEventInfo { }
-
-    //触发 演示
-    //EventCenter.EventTrigger<HideTipsEvent>();
+    public static class OnlyOneIdExt
+    {
+        public static int Init(this IOnlyOneID self) => OnlyOneIdPool.Init(self);
+        public static void TryInit(this IOnlyOneID self) { if (self.Rid == 0) OnlyOneIdPool.Init(self); }
+        public static int GetID(this IOnlyOneID self) => OnlyOneIdPool.Get(self);
+        public static void ReleaseID(this IOnlyOneID self) => OnlyOneIdPool.Release(self);
+    }
     #endregion
-    public interface IEventInfo { }
-    /// <summary>
-    /// 事件中心
-    /// （定义的事件不能重名 否则会认错
-    /// </summary>
+
     public static class EventCenter
     {
-        #region EventInfo....
-        // 定义一个通用的事件信息类，能够处理不同数量参数的 Action 和 Func
-        public class EventInfo<TDelegate> : IEventInfo where TDelegate : Delegate
+        #region Reverse Index (listener -> regs) + Removers
+
+        private readonly struct RegKey : IEquatable<RegKey>
         {
-            public TDelegate Actions { get; set; }
-            public EventInfo(TDelegate action)
+            public readonly string EventName;
+            public readonly Type DelegateType;
+            public readonly bool IsTR;
+
+            public RegKey(string eventName, Type delegateType, bool isTR)
             {
-                // actions += action;
-                Actions = Delegate.Combine(Actions, action) as TDelegate;
+                EventName = eventName;
+                DelegateType = delegateType;
+                IsTR = isTR;
             }
+
+            public bool Equals(RegKey other) =>
+                EventName == other.EventName && DelegateType == other.DelegateType && IsTR == other.IsTR;
+
+            public override bool Equals(object obj) => obj is RegKey other && Equals(other);
+            public override int GetHashCode() => HashCode.Combine(EventName, DelegateType, IsTR);
         }
-        //使用 Delegate.Combine 替代 += 是一种处理泛型委托的通用方法，Delegate.Remove 可以用于实现 -= 的行为。
-        //一些要注意的地方：
-        //Delegate.Combine 和 Delegate.Remove 都返回 Delegate 类型，因此需要将结果显式地转换回泛型委托类型 TDelegate。
-        //Delegate.Combine 可以接受 null 值作为参数，如果 Actions 或 action 为 null，它依然可以工作。返回结果将是非 null 委托，除非两个参数都是 null。
-        //eventInfo.actions?.DynamicInvoke();
-        #endregion
-        /// <summary>
-        /// 事件名 < 监听对象名 , 对象监听事件函数 >
-        /// </summary>
-        private static Dictionary<string, Dictionary<string, EventInfo<Delegate>>> eventDic = new();
 
-#if UNITY_EDITOR
-        /// <summary>
-        /// 新方法使用示例:
-        /// </summary>
-        static void NewFunTest()
+        private static readonly Dictionary<string, HashSet<RegKey>> _listenerRegs = new();
+
+        private interface IRemover
         {
-            //使用示例:
-
-            // 对于无参数且无返回值的函数
-            var eventInfo = new EventInfo<UnityAction>(() => Debug.Log("Action Invoked"));
-
-            // 对于带有一个参数且无返回值的函数
-            var eventInfo1Param = new EventInfo<UnityAction<int>>(x => Debug.Log($"Action with int: {x}"));
-
-            // 对于带有2个参数且无返回值的函数
-            var eventInfo2Param = new EventInfo<UnityAction<int, string>>((x, y) => Debug.Log($"Action with int: {x} and string: {y}"));
-
-            // 使用Func委托，带有返回值的委托
-            var eventInfoWithReturn = new EventInfo<Func<int, int>>(x => x * 2);
+            void Remove(string eventName, string listenerName);
+            void RemoveTR(string eventName, string listenerName);
         }
-#endif
-        #region IOnlyOneID
-        private static readonly object lockObj = new();//多线程访问时可能会有问题，如果多个线程同时调用 Init()，可能会导致 ID 竞争
-        public static int Init(this IOnlyOneID self)
+
+        private sealed class Remover<TDelegate> : IRemover where TDelegate : Delegate
         {
-            lock (lockObj)
+            public void Remove(string eventName, string listenerName) => EventTable<TDelegate>.RemoveListener(eventName, listenerName);
+            public void RemoveTR(string eventName, string listenerName) => EventTableTR<TDelegate>.RemoveListener(eventName, listenerName);
+        }
+
+        private static readonly Dictionary<Type, IRemover> _removers = new();
+
+        private static IRemover GetRemover(Type delegateType)
+        {
+            if (_removers.TryGetValue(delegateType, out var r)) return r;
+
+            var removerType = typeof(Remover<>).MakeGenericType(delegateType);
+            r = (IRemover)Activator.CreateInstance(removerType);
+            _removers.Add(delegateType, r);
+            return r;
+        }
+
+        private static void Track(string listenerName, string eventName, Type delegateType, bool isTR)
+        {
+            if (!_listenerRegs.TryGetValue(listenerName, out var set))
             {
-                self.ReleaseID();
-                if (IOnlyOneID.UnUseIDList.Count > 0)
+                set = new HashSet<RegKey>();
+                _listenerRegs.Add(listenerName, set);
+            }
+            set.Add(new RegKey(eventName, delegateType, isTR));
+        }
+
+        #endregion
+
+        #region Clear-All Registry (so Clear() actually clears all used signatures)
+
+        // Each generic EventTable<TDelegate> / EventTableTR<TDelegate> registers its _events.Clear once.
+        private static readonly List<Action> _clearAll = new();
+        private static readonly HashSet<(bool isTR, Type t)> _registeredClear = new();
+
+        private static void RegisterClear(bool isTR, Type t, Action clearer)
+        {
+            if (_registeredClear.Add((isTR, t)))
+                _clearAll.Add(clearer);
+        }
+
+        #endregion
+
+        #region Buckets
+
+        private sealed class Bucket<TDelegate> where TDelegate : Delegate
+        {
+            private readonly Dictionary<string, TDelegate> _perListener = new(16);
+            private TDelegate _combined;
+
+            public int Count => _perListener.Count;
+            public TDelegate Combined => _combined;
+
+            public void Add(string listenerName, TDelegate action)
+            {
+                if (_perListener.TryGetValue(listenerName, out var old))
                 {
-                    self.Rid = IOnlyOneID.UnUseIDList.Dequeue();
+                    var merged = (TDelegate)Delegate.Combine(old, action);
+                    _perListener[listenerName] = merged;
+
+                    _combined = (TDelegate)Delegate.Remove(_combined, old);
+                    _combined = (TDelegate)Delegate.Combine(_combined, merged);
                 }
                 else
                 {
-                    self.Rid = (IOnlyOneID.UseIDList.Count > 0) ? IOnlyOneID.UseIDList.Max + 1 : 1;
+                    _perListener.Add(listenerName, action);
+                    _combined = (TDelegate)Delegate.Combine(_combined, action);
                 }
-                IOnlyOneID.UseIDList.Add(self.Rid);
-                return self.Rid;
+            }
+
+            public void Remove(string listenerName)
+            {
+                if (_perListener.TryGetValue(listenerName, out var old))
+                {
+                    _perListener.Remove(listenerName);
+                    _combined = (TDelegate)Delegate.Remove(_combined, old);
+                }
+            }
+
+            public void Remove(string listenerName, TDelegate action)
+            {
+                if (_perListener.TryGetValue(listenerName, out var old))
+                {
+                    var newDel = (TDelegate)Delegate.Remove(old, action);
+
+                    _combined = (TDelegate)Delegate.Remove(_combined, old);
+
+                    if (newDel == null)
+                        _perListener.Remove(listenerName);
+                    else
+                    {
+                        _perListener[listenerName] = newDel;
+                        _combined = (TDelegate)Delegate.Combine(_combined, newDel);
+                    }
+                }
             }
         }
-        public static void TryInit(this IOnlyOneID self)
+
+        private sealed class BucketTR<TDelegate> where TDelegate : Delegate
         {
-            if (self.Rid != 0) return;
-            Init(self);
-        }
-        public static int GetID(this IOnlyOneID self)
-        {
-            if (self.Rid != 0) return self.Rid;
-            return Init(self);
-        }
-        public static void ReleaseID(this IOnlyOneID self)
-        {
-            if (self.Rid == 0) return;
-            var id = self.Rid;
-            if (IOnlyOneID.UseIDList.Remove(id))
-                IOnlyOneID.UnUseIDList.Enqueue(id);//IOnlyOneID.UnUseIDList.Add(id);
-            self.Rid = 0;
+            private string _ownerListenerName;
+            private TDelegate _func;
+
+            public bool Has => _func != null;
+
+            public void Set(string listenerName, TDelegate func)
+            {
+                _ownerListenerName = listenerName;
+                _func = func;
+            }
+
+            public void Remove(string listenerName)
+            {
+                if (_ownerListenerName == listenerName)
+                {
+                    _ownerListenerName = null;
+                    _func = null;
+                }
+            }
+
+            public TDelegate Func => _func;
         }
 
         #endregion
-        #region 无返回值  一对多 / 多对多
-        /// <summary>
-        /// 定义的事件不能同名 否则会认错
-        /// </summary>
-        public static IListener AddListener<T>(this IListener self, UnityAction action) where T : IEventInfo
+
+        #region Tables (per delegate signature)
+
+        private static class EventTable<TDelegate> where TDelegate : Delegate
         {
-            return AddListener(self, typeof(T).ToString(), action);
+            private static readonly Dictionary<string, Bucket<TDelegate>> _events = new();
+
+            static EventTable()
+            {
+                RegisterClear(isTR: false, typeof(TDelegate), _events.Clear);
+            }
+
+            public static Bucket<TDelegate> GetOrCreate(string eventName)
+            {
+                if (!_events.TryGetValue(eventName, out var bucket))
+                {
+                    bucket = new Bucket<TDelegate>();
+                    _events.Add(eventName, bucket);
+                }
+                return bucket;
+            }
+
+            public static bool TryGet(string eventName, out Bucket<TDelegate> bucket)
+                => _events.TryGetValue(eventName, out bucket);
+
+            public static void RemoveListener(string eventName, string listenerName)
+            {
+                if (_events.TryGetValue(eventName, out var bucket))
+                {
+                    bucket.Remove(listenerName);
+                    if (bucket.Count == 0) _events.Remove(eventName);
+                }
+            }
         }
-        public static IListener AddListener(this IListener self, string actionsName, UnityAction action) => AddListener<UnityAction>(self, actionsName, action);
-        public static IListener AddListener<T>(this IListener self, string actionsName, UnityAction<T> action) => AddListener<UnityAction<T>>(self, actionsName, action);
 
-        /// <summary>
-        ///添加到 事件+对象名的监听事件集合 当对象销毁时 移除监听事件集合
-        /// </summary>
-        /// <param name="name">事件+对象名</param>
-        /// <param name="action"></param>
-        /// <param name="gameObject"></param>
-        /// 
-        public static IListener AddListener<T, T1>(this IListener self, string actionsName, UnityAction<T, T1> action) => AddListener<UnityAction<T, T1>>(self, actionsName, action);
-        public static IListener AddListener<T, T1, T2>(this IListener self, string actionsName, UnityAction<T, T1, T2> action) => AddListener<UnityAction<T, T1, T2>>(self, actionsName, action);
-        public static IListener AddListener<TDelegate>(this IListener self, string actionsName, TDelegate action) where TDelegate : Delegate
+        private static class EventTableTR<TDelegate> where TDelegate : Delegate
         {
-            if (!eventDic.TryGetValue(actionsName, out var actionDict))
+            private static readonly Dictionary<string, BucketTR<TDelegate>> _events = new();
+
+            static EventTableTR()
             {
-                actionDict = new Dictionary<string, EventInfo<Delegate>>();
-                eventDic.Add(actionsName, actionDict);
+                RegisterClear(isTR: true, typeof(TDelegate), _events.Clear);
             }
 
-            var eventName = self.ListenerName;
-            if (!actionDict.TryGetValue(eventName, out var eventInfo))
+            public static BucketTR<TDelegate> GetOrCreate(string eventName)
             {
-                eventInfo = new EventInfo<Delegate>(action);
-                actionDict.Add(eventName, eventInfo);
+                if (!_events.TryGetValue(eventName, out var bucket))
+                {
+                    bucket = new BucketTR<TDelegate>();
+                    _events.Add(eventName, bucket);
+                }
+                return bucket;
             }
-            else
-                eventInfo.Actions = Delegate.Combine(eventInfo.Actions, action);
+
+            public static bool TryGet(string eventName, out BucketTR<TDelegate> bucket)
+                => _events.TryGetValue(eventName, out bucket);
+
+            public static void RemoveListener(string eventName, string listenerName)
+            {
+                if (_events.TryGetValue(eventName, out var bucket))
+                {
+                    bucket.Remove(listenerName);
+                    if (!bucket.Has) _events.Remove(eventName);
+                }
+            }
+        }
+
+        #endregion
+
+        #region Enum -> EventName Key (fast + cached)
+
+        private static class EnumEventName
+        {
+            private static readonly Dictionary<(RuntimeTypeHandle, ulong), string> _cache = new();
+
+            public static string ToKey<TEnum>(TEnum e) where TEnum : unmanaged, Enum
+            {
+                var th = typeof(TEnum).TypeHandle;
+                ulong bits = EnumToUInt64(e);
+                var key = (th, bits);
+
+                if (_cache.TryGetValue(key, out var s))
+                    return s;
+
+                s = $"{typeof(TEnum).FullName}.{e}";
+                _cache[key] = s;
+                return s;
+            }
+
+            public static void ClearCache() => _cache.Clear();
+
+            private static ulong EnumToUInt64<TEnum>(TEnum value) where TEnum : unmanaged, Enum
+            {
+                unsafe
+                {
+                    if (sizeof(TEnum) == 1) return *(byte*)&value;
+                    if (sizeof(TEnum) == 2) return *(ushort*)&value;
+                    if (sizeof(TEnum) == 4) return *(uint*)&value;
+                    if (sizeof(TEnum) == 8) return *(ulong*)&value;
+                }
+                return 0;
+            }
+        }
+
+        private static string Key<TEnum>(TEnum evt) where TEnum : unmanaged, Enum => EnumEventName.ToKey(evt);
+
+        #endregion
+
+        #region Core helpers (reduce repetition)
+
+        private static IListener AddCore<TDelegate>(IListener self, string eventName, TDelegate action)
+            where TDelegate : Delegate
+        {
+            if (self == null || action == null) return self;
+            var ln = self.ListenerName;
+
+            EventTable<TDelegate>.GetOrCreate(eventName).Add(ln, action);
+            Track(ln, eventName, typeof(TDelegate), isTR: false);
+            return self;
+        }
+
+        private static IListener AddTRCore<TDelegate>(IListener self, string eventName, TDelegate func)
+            where TDelegate : Delegate
+        {
+            if (self == null || func == null) return self;
+            var ln = self.ListenerName;
+
+            EventTableTR<TDelegate>.GetOrCreate(eventName).Set(ln, func);
+            Track(ln, eventName, typeof(TDelegate), isTR: true);
+            return self;
+        }
+
+        private static IListener RemoveCore<TDelegate>(IListener self, string eventName, TDelegate action)
+            where TDelegate : Delegate
+        {
+            if (self == null || action == null) return self;
+            var ln = self.ListenerName;
+
+            if (EventTable<TDelegate>.TryGet(eventName, out var bucket))
+                bucket.Remove(ln, action);
 
             return self;
         }
 
-        public static void EventTrigger<T>() => EventTrigger(typeof(T).ToString());
-        public static void EventTrigger(string name) => EventTrigger<object, object, object>(name, null, null, null);
-        public static void EventTrigger<T>(string name, T info) => EventTrigger<T, object, object>(name, info, null, null);
-        public static void EventTrigger<T, T1>(string name, T info, T1 info1) => EventTrigger<T, T1, object>(name, info, info1, null);
-        public static void EventTrigger<T, T1, T2>(string actionsName, T info, T1 info1, T2 info2)
+        #endregion
+
+        #region AddListener (string / IEventInfo type)
+
+        public static IListener AddListener<TEvent>(this IListener self, UnityAction action)
+            where TEvent : IEventInfo
+            => AddListener(self, typeof(TEvent).FullName, action);
+
+        public static IListener AddListener(this IListener self, string eventName, UnityAction action)
+            => AddCore(self, eventName, action);
+
+        public static IListener AddListener<T>(this IListener self, string eventName, UnityAction<T> action)
+            => AddCore(self, eventName, action);
+
+        public static IListener AddListener<T, T1>(this IListener self, string eventName, UnityAction<T, T1> action)
+            => AddCore(self, eventName, action);
+
+        public static IListener AddListener<T, T1, T2>(this IListener self, string eventName, UnityAction<T, T1, T2> action)
+            => AddCore(self, eventName, action);
+
+        #endregion
+
+        #region EventTrigger (string / IEventInfo type)
+
+        public static void EventTrigger<TEvent>() where TEvent : IEventInfo
+            => EventTrigger(typeof(TEvent).FullName);
+
+
+        public static void EventTrigger(string eventName)
         {
-            if (!eventDic.TryGetValue(actionsName, out var actionDict))
+#if UNITY_EDITOR
+            Debug_RecordAttempt(eventName);
+#endif
+
+            if (!EventTable<UnityAction>.TryGet(eventName, out var bucket) || bucket.Combined == null)
             {
-                Debug.LogWarning($"未能找到事件{actionsName}");
+#if UNITY_EDITOR
+                Debug_RecordFail(eventName, DebugTriggerResult.Fail_NotFound);
+                Debug.LogWarning($"未能找到事件 {eventName}");
+#endif
                 return;
             }
-            if (info == null)
-            {
-                //foreach (var eventInfo in actionDict.Values)
-                //eventInfo.Actions?.DynamicInvoke();
-                for (int i = 0; i < actionDict.Values.Count; i++)
-                {
-                    try
-                    {
-                        var eventInfo = actionDict.Values.ElementAt(i);
-                        eventInfo.Actions?.DynamicInvoke();
-                    }
-                    catch (Exception e)
-                    {
-                        Debug.LogError($"{e} {e.Message}");
-                    }
-                }
-            }
-            else if (info1 == null)
-            {
-                //foreach (var eventInfo in actionDict.Values)
-                //    eventInfo.Actions?.DynamicInvoke(info);
-                for (int i = 0; i < actionDict.Values.Count; i++)
-                {
-                    var eventInfo = actionDict.Values.ElementAt(i);
-                    eventInfo.Actions?.DynamicInvoke(info);
-                    //try
-                    //{
-                    //    eventInfo.Actions?.DynamicInvoke(info);
-                    //}
-                    //catch (Exception ex)
-                    //{
-                    //    Debug.LogError($"Exception during event invocation: {ex.Message}\n{ex.StackTrace}");
-                    //    if (ex.InnerException != null)
-                    //    {
-                    //        Debug.LogError($"Inner Exception: {ex.InnerException.Message}\n{ex.InnerException.StackTrace}");
-                    //    }
-                    //}
-                }
-            }
-            else if (info2 == null)
-            {
-                for (int i = 0; i < actionDict.Values.Count; i++)
-                {
-                    var eventInfo = actionDict.Values.ElementAt(i);
-                    eventInfo.Actions?.DynamicInvoke(info, info1);
-                }
-                //foreach (var eventInfo in actionDict.Values)
-                //    eventInfo.Actions?.DynamicInvoke(info, info1);
-            }
-            else
-            {
-                for (int i = 0; i < actionDict.Values.Count; i++)
-                {
-                    try
-                    {
-                        var eventInfo = actionDict.Values.ElementAt(i);
-                        eventInfo.Actions?.DynamicInvoke(info, info1, info2);
-                    }
-                    catch (Exception e)
-                    {
-                        Debug.LogException(e);
-                    }
-                }
-                //foreach (var eventInfo in actionDict.Values)
-                //    eventInfo.Actions?.DynamicInvoke(info, info1, info2);
-            }
-        }
 
-        #region 有返回值 一对一
-        public static IListener AddListener_TR<TResult>(this IListener self, string actionsName, Func<TResult> action) => AddListener_TR<Func<TResult>>(self, actionsName, action);
-        public static IListener AddListener_TR<T, TResult>(this IListener self, string actionsName, Func<T, TResult> action) => AddListener_TR<Func<T, TResult>>(self, actionsName, action);
-        public static IListener AddListener_TR<T, T1, TResult>(this IListener self, string actionsName, Func<T, T1, TResult> action) => AddListener_TR<Func<T, T1, TResult>>(self, actionsName, action);
-        public static IListener AddListener_TR<T, T1, T2, TResult>(this IListener self, string actionsName, Func<T, T1, T2, TResult> action) => AddListener_TR<Func<T, T1, T2, TResult>>(self, actionsName, action);
-        public static IListener AddListener_TR<TDelegate>(this IListener self, string actionsName, TDelegate action) where TDelegate : Delegate
-        {
-            if (!eventDic.TryGetValue(actionsName, out var actionDict))
-            {
-                actionDict = new Dictionary<string, EventInfo<Delegate>>();
-                eventDic.Add(actionsName, actionDict);
-            }
-
-            var eventObjName = self.ListenerName;
-            if (!actionDict.TryGetValue(eventObjName, out var eventInfo))
-            {
-                eventInfo = new EventInfo<Delegate>(action);
-                actionDict.Add(eventObjName, eventInfo);
-            }
-            else
-                eventInfo.Actions = Delegate.Combine(eventInfo.Actions, action);
-            return self;
-        }
-
-        public static TResult EventTrigger_TR<TResult>(string name) => EventTrigger_TR<object, object, object, TResult>(name, null, null, null);
-        public static TResult EventTrigger_TR<T, TResult>(string name, T info) => EventTrigger_TR<T, object, object, TResult>(name, info, null, null);
-        public static TResult EventTrigger_TR<T, T1, TResult>(string name, T info, T1 info1) => EventTrigger_TR<T, T1, object, TResult>(name, info, info1, null);
-        public static TResult EventTrigger_TR<T, T1, T2, TResult>(string actionsName, T info, T1 info1, T2 info2)
-        {
-            if (!eventDic.TryGetValue(actionsName, out var actionDict))
-            {
-                Debug.LogWarning($"未能找到事件{actionsName}");
-                return default;
-            }
-            foreach (var eventInfo in actionDict.Values)
-            {
-                if (info == null)
-                {
-                    return (TResult)eventInfo.Actions?.DynamicInvoke();
-                }
-                else if (info1 == null)
-                {
-                    return (TResult)eventInfo.Actions?.DynamicInvoke(info);
-                }
-                else if (info2 == null)
-                {
-                    return (TResult)eventInfo.Actions?.DynamicInvoke(info, info1);
-                }
-                else
-                {
-                    try
-                    {
-                        return (TResult)eventInfo.Actions?.DynamicInvoke(info, info1, info2);
-                    }
-                    catch (Exception e)
-                    {
-                        Debug.LogException(e);
-                    }
-                }
-            }
-            Debug.LogWarning($"未能找到事件{actionsName}");
-            return default;
-        }
-        #endregion
-        /// <summary>
-        /// 把自己的某个方法从某个事件中移除
-        /// </summary>
-        /// <typeparam name="TDelegate"></typeparam>
-        /// <param name="self"></param>
-        /// <param name="actionsName"></param>
-        /// <param name="action"></param>
-        /// <returns></returns>
-        public static IListener RemoveListener<TDelegate>(this IListener self, string actionsName, TDelegate action)
-        where TDelegate : Delegate
-        {
-            if (eventDic.TryGetValue(actionsName, out var actionDict))
-            {
-                var eventName = self.ListenerName;
-                if (actionDict.TryGetValue(eventName, out var eventInfo))
-                {
-                    eventInfo.Actions = Delegate.Remove(eventInfo.Actions, action);
-                }
-            }
-            return self;
-        }
-        /// <summary>
-        ///  把自己从某个事件中移除
-        /// </summary>
-        /// <param name="self"></param>
-        /// <param name="actionsName"></param>
-        /// <returns></returns>
-        public static IListener RemoveOne_ThisObjListenter(this IListener self, string actionsName)
-        {
-            if (eventDic.TryGetValue(actionsName, out Dictionary<string, EventInfo<Delegate>> value)
-                && value.ContainsKey(self.ListenerName))
-                value.Remove(self.ListenerName);
-            else
-                Debug.LogWarning($"未能找到事件{actionsName}");
-            return self;
-        }
-        /// <summary>
-        /// 把自己从所有事件中移除
-        /// </summary>
-        /// <param name="self"></param>
-        /// <returns></returns>
-        public static IListener RemoveALL_ThisObjListenter(this IListener self)
-        {
-            if (self == null)
-            {
-                Debug.LogError("IAddEventAction == null");
-                return null;
-            }
             try
             {
-                ClearGameObjectActions(self.ListenerName);
-                if (self is IOnlyOneID oneID)
-                    oneID.ReleaseID();
+                bucket.Combined.Invoke();
+#if UNITY_EDITOR
+                Debug_RecordSuccess(eventName);
+#endif
             }
             catch (Exception e)
             {
+#if UNITY_EDITOR
+                Debug_RecordFail(eventName, DebugTriggerResult.Fail_Exception, e);
                 Debug.LogException(e);
+#endif
             }
+        }
+        public static void EventTrigger<T>(string eventName, T a0)
+        {
+#if UNITY_EDITOR
+            Debug_RecordAttempt(eventName);
+#endif
+
+            if (!EventTable<UnityAction<T>>.TryGet(eventName, out var bucket) || bucket.Combined == null)
+            {
+#if UNITY_EDITOR
+                Debug_RecordFail(eventName, DebugTriggerResult.Fail_NotFound);
+                Debug.LogWarning($"未能找到事件 {eventName}");
+#endif
+                return;
+            }
+
+            try
+            {
+                bucket.Combined.Invoke(a0);
+#if UNITY_EDITOR
+                Debug_RecordSuccess(eventName);
+#endif
+            }
+            catch (Exception e)
+            {
+#if UNITY_EDITOR
+                Debug_RecordFail(eventName, DebugTriggerResult.Fail_Exception, e);
+                Debug.LogException(e);
+#endif
+            }
+        }
+
+        public static void EventTrigger<T, T1>(string eventName, T a0, T1 a1)
+        {
+#if UNITY_EDITOR
+            Debug_RecordAttempt(eventName);
+#endif
+
+            if (!EventTable<UnityAction<T, T1>>.TryGet(eventName, out var bucket) || bucket.Combined == null)
+            {
+#if UNITY_EDITOR
+                Debug_RecordFail(eventName, DebugTriggerResult.Fail_NotFound);
+                Debug.LogWarning($"未能找到事件 {eventName}");
+#endif
+                return;
+            }
+
+            try
+            {
+                bucket.Combined.Invoke(a0, a1);
+#if UNITY_EDITOR
+                Debug_RecordSuccess(eventName);
+#endif
+            }
+            catch (Exception e)
+            {
+#if UNITY_EDITOR
+                Debug_RecordFail(eventName, DebugTriggerResult.Fail_Exception, e);
+                Debug.LogException(e);
+#endif
+            }
+        }
+
+        public static void EventTrigger<T, T1, T2>(string eventName, T a0, T1 a1, T2 a2)
+        {
+#if UNITY_EDITOR
+            Debug_RecordAttempt(eventName);
+#endif
+
+            if (!EventTable<UnityAction<T, T1, T2>>.TryGet(eventName, out var bucket) || bucket.Combined == null)
+            {
+#if UNITY_EDITOR
+                Debug_RecordFail(eventName, DebugTriggerResult.Fail_NotFound);
+                Debug.LogWarning($"未能找到事件 {eventName}");
+#endif
+                return;
+            }
+
+            try
+            {
+                bucket.Combined.Invoke(a0, a1, a2);
+#if UNITY_EDITOR
+                Debug_RecordSuccess(eventName);
+#endif
+            }
+            catch (Exception e)
+            {
+#if UNITY_EDITOR
+                Debug_RecordFail(eventName, DebugTriggerResult.Fail_Exception, e);
+                Debug.LogException(e);
+#endif
+            }
+        }
+
+        #endregion
+
+        #region RemoveListener (string)
+
+        public static IListener RemoveListener(this IListener self, string eventName, UnityAction action)
+            => RemoveCore(self, eventName, action);
+
+        public static IListener RemoveListener<T>(this IListener self, string eventName, UnityAction<T> action)
+            => RemoveCore(self, eventName, action);
+
+        public static IListener RemoveListener<T, T1>(this IListener self, string eventName, UnityAction<T, T1> action)
+            => RemoveCore(self, eventName, action);
+
+        public static IListener RemoveListener<T, T1, T2>(this IListener self, string eventName, UnityAction<T, T1, T2> action)
+            => RemoveCore(self, eventName, action);
+
+        #endregion
+
+        #region AddListener_TR / EventTrigger_TR (string)
+
+        public static IListener AddListener_TR<TResult>(this IListener self, string eventName, Func<TResult> func)
+            => AddTRCore(self, eventName, func);
+
+        public static IListener AddListener_TR<T, TResult>(this IListener self, string eventName, Func<T, TResult> func)
+            => AddTRCore(self, eventName, func);
+
+        public static IListener AddListener_TR<T, T1, TResult>(this IListener self, string eventName, Func<T, T1, TResult> func)
+            => AddTRCore(self, eventName, func);
+
+        public static IListener AddListener_TR<T, T1, T2, TResult>(this IListener self, string eventName, Func<T, T1, T2, TResult> func)
+            => AddTRCore(self, eventName, func);
+
+        public static TResult EventTrigger_TR<TResult>(string eventName)
+        {
+#if UNITY_EDITOR
+            Debug_RecordAttempt(eventName);
+#endif
+
+            if (!EventTableTR<Func<TResult>>.TryGet(eventName, out var bucket))
+            {
+#if UNITY_EDITOR
+                Debug_RecordFail(eventName, DebugTriggerResult.Fail_NotFound);
+                Debug.LogWarning($"未能找到TR事件 {eventName}");
+#endif
+                return default;
+            }
+
+            if (bucket.Func == null)
+            {
+#if UNITY_EDITOR
+                Debug_RecordFail(eventName, DebugTriggerResult.Fail_NullDelegate);
+                Debug.LogWarning($"TR事件 {eventName} 的委托为空（Func 为 null）");
+#endif
+                return default;
+            }
+
+            try
+            {
+                var ret = bucket.Func.Invoke();
+#if UNITY_EDITOR
+                Debug_RecordSuccess(eventName);
+#endif
+                return ret;
+            }
+            catch (Exception e)
+            {
+#if UNITY_EDITOR
+                Debug_RecordFail(eventName, DebugTriggerResult.Fail_Exception, e);
+                Debug.LogException(e);
+#endif
+                return default;
+            }
+        }
+
+        public static TResult EventTrigger_TR<T, TResult>(string eventName, T a0)
+        {
+#if UNITY_EDITOR
+            Debug_RecordAttempt(eventName);
+#endif
+
+            if (!EventTableTR<Func<T, TResult>>.TryGet(eventName, out var bucket))
+            {
+#if UNITY_EDITOR
+                Debug_RecordFail(eventName, DebugTriggerResult.Fail_NotFound);
+                Debug.LogWarning($"未能找到TR事件 {eventName}");
+#endif
+                return default;
+            }
+
+            if (bucket.Func == null)
+            {
+#if UNITY_EDITOR
+                Debug_RecordFail(eventName, DebugTriggerResult.Fail_NullDelegate);
+                Debug.LogWarning($"TR事件 {eventName} 的委托为空（Func 为 null）");
+#endif
+                return default;
+            }
+
+            try
+            {
+                var ret = bucket.Func.Invoke(a0);
+#if UNITY_EDITOR
+                Debug_RecordSuccess(eventName);
+#endif
+                return ret;
+            }
+            catch (Exception e)
+            {
+#if UNITY_EDITOR
+                Debug_RecordFail(eventName, DebugTriggerResult.Fail_Exception, e);
+                Debug.LogException(e);
+#endif
+                return default;
+            }
+        }
+
+        public static TResult EventTrigger_TR<T, T1, TResult>(string eventName, T a0, T1 a1)
+        {
+#if UNITY_EDITOR
+            Debug_RecordAttempt(eventName);
+#endif
+
+            if (!EventTableTR<Func<T, T1, TResult>>.TryGet(eventName, out var bucket))
+            {
+#if UNITY_EDITOR
+                Debug_RecordFail(eventName, DebugTriggerResult.Fail_NotFound);
+                Debug.LogWarning($"未能找到TR事件 {eventName}");
+#endif
+                return default;
+            }
+
+            if (bucket.Func == null)
+            {
+#if UNITY_EDITOR
+                Debug_RecordFail(eventName, DebugTriggerResult.Fail_NullDelegate);
+                Debug.LogWarning($"TR事件 {eventName} 的委托为空（Func 为 null）");
+#endif
+                return default;
+            }
+
+            try
+            {
+                var ret = bucket.Func.Invoke(a0, a1);
+#if UNITY_EDITOR
+                Debug_RecordSuccess(eventName);
+#endif
+                return ret;
+            }
+            catch (Exception e)
+            {
+#if UNITY_EDITOR
+                Debug_RecordFail(eventName, DebugTriggerResult.Fail_Exception, e);
+                Debug.LogException(e);
+#endif
+                return default;
+            }
+        }
+
+        public static TResult EventTrigger_TR<T, T1, T2, TResult>(string eventName, T a0, T1 a1, T2 a2)
+        {
+#if UNITY_EDITOR
+            Debug_RecordAttempt(eventName);
+#endif
+
+            if (!EventTableTR<Func<T, T1, T2, TResult>>.TryGet(eventName, out var bucket))
+            {
+#if UNITY_EDITOR
+                Debug_RecordFail(eventName, DebugTriggerResult.Fail_NotFound);
+                Debug.LogWarning($"未能找到TR事件 {eventName}");
+#endif
+                return default;
+            }
+
+            if (bucket.Func == null)
+            {
+#if UNITY_EDITOR
+                Debug_RecordFail(eventName, DebugTriggerResult.Fail_NullDelegate);
+                Debug.LogWarning($"TR事件 {eventName} 的委托为空（Func 为 null）");
+#endif
+                return default;
+            }
+
+            try
+            {
+                var ret = bucket.Func.Invoke(a0, a1, a2);
+#if UNITY_EDITOR
+                Debug_RecordSuccess(eventName);
+#endif
+                return ret;
+            }
+            catch (Exception e)
+            {
+#if UNITY_EDITOR
+                Debug_RecordFail(eventName, DebugTriggerResult.Fail_Exception, e);
+                Debug.LogException(e);
+#endif
+                return default;
+            }
+        }
+        #endregion
+
+        #region RemoveOne / RemoveALL
+
+        public static IListener RemoveOne_ThisObjListenter(this IListener self, string eventName)
+        {
+            if (self == null) return null;
+            var ln = self.ListenerName;
+
+            if (_listenerRegs.TryGetValue(ln, out var set))
+            {
+                var toRemove = new List<RegKey>();
+                foreach (var k in set)
+                    if (k.EventName == eventName)
+                        toRemove.Add(k);
+
+                for (int i = 0; i < toRemove.Count; i++)
+                {
+                    var k = toRemove[i];
+                    var remover = GetRemover(k.DelegateType);
+                    if (k.IsTR) remover.RemoveTR(k.EventName, ln);
+                    else remover.Remove(k.EventName, ln);
+
+                    set.Remove(k);
+                }
+
+                if (set.Count == 0) _listenerRegs.Remove(ln);
+            }
+#if UNITY_EDITOR
+            else Debug.LogWarning($"RemoveOne: listener={ln} 没有注册记录");
+#endif
+            return self;
+        }
+
+        public static IListener RemoveALL_ThisObjListenter(this IListener self)
+        {
+            if (self == null) return null;
+
+            var ln = self.ListenerName;
+
+            if (_listenerRegs.TryGetValue(ln, out var set))
+            {
+                foreach (var k in set)
+                {
+                    var remover = GetRemover(k.DelegateType);
+                    if (k.IsTR) remover.RemoveTR(k.EventName, ln);
+                    else remover.Remove(k.EventName, ln);
+                }
+                _listenerRegs.Remove(ln);
+            }
+
+            if (self is IOnlyOneID oneID)
+                oneID.ReleaseID();
 
             return self;
         }
 
         #endregion
 
-        public static void ClearGameObjectActions(string objName)
-        {
-            foreach (var item in eventDic)//遍历所有事件
-            {
-                //查找字典中 objName监听的事件
-                if (item.Value.ContainsKey(objName))
-                {
-                    item.Value.Remove(objName);
-                }
-            }
-        }
+        #region UnRegister (requires your components ClearActionsOnDestroy/ClearActionsOnDisable)
 
         public static IListener UnRegisterWhenDestroyed(this IListener self)
         {
-            //创建了一个mono脚本（把这个对象的所有销毁的逻辑交给这个脚本执行）
             if (self is MonoBehaviour mono)
-                mono.gameObject.AddComponent<ClearActionsOnDestroy>().OnInit(self.ListenerName);
+            {
+                var c = mono.GetComponent<ClearActionsOnDestroy>();
+                if (c == null) c = mono.gameObject.AddComponent<ClearActionsOnDestroy>();
+                c.OnInit(self);
+            }
             return self;
         }
 
         public static IListener UnRegisterWhenDisabled(this IListener self)
         {
-            //创建了一个mono脚本（把这个对象的所有销毁的逻辑交给这个脚本执行）
-            if (self is MonoBehaviour mono) mono.gameObject.AddComponent<ClearActionsOnDisable>().OnInit(self.ListenerName);
+            if (self is MonoBehaviour mono)
+            {
+                var c = mono.GetComponent<ClearActionsOnDisable>();
+                if (c == null) c = mono.gameObject.AddComponent<ClearActionsOnDisable>();
+                c.OnInit(self);
+            }
             return self;
         }
 
-        /// <summary>
-        /// 清空事件中心
-        /// </summary>
+        #endregion
+
+        #region Clear
+
         public static void Clear()
         {
-            eventDic.Clear();
-            IOnlyOneID.Clear();
+            // Clear all used generic signature tables
+            for (int i = 0; i < _clearAll.Count; i++)
+                _clearAll[i]?.Invoke();
+
+            _listenerRegs.Clear();
+            _removers.Clear();
+            EnumEventName.ClearCache();
+            OnlyOneIdPool.Clear();
         }
+
+        #endregion
+
+        #region Enum overloads (same name / same params but enum)
+
+        // AddListener
+        public static IListener AddListener<TEnum>(this IListener self, TEnum evt, UnityAction action)
+            where TEnum : unmanaged, Enum
+            => AddListener(self, Key(evt), action);
+
+        public static IListener AddListener<TEnum, T>(this IListener self, TEnum evt, UnityAction<T> action)
+            where TEnum : unmanaged, Enum
+            => AddListener(self, Key(evt), action);
+
+        public static IListener AddListener<TEnum, T, T1>(this IListener self, TEnum evt, UnityAction<T, T1> action)
+            where TEnum : unmanaged, Enum
+            => AddListener(self, Key(evt), action);
+
+        public static IListener AddListener<TEnum, T, T1, T2>(this IListener self, TEnum evt, UnityAction<T, T1, T2> action)
+            where TEnum : unmanaged, Enum
+            => AddListener(self, Key(evt), action);
+
+        // EventTrigger
+        public static void EventTrigger<TEnum>(TEnum evt)
+            where TEnum : unmanaged, Enum
+            => EventTrigger(Key(evt));
+
+        public static void EventTrigger<TEnum, T>(TEnum evt, T a0)
+            where TEnum : unmanaged, Enum
+            => EventTrigger(Key(evt), a0);
+
+        public static void EventTrigger<TEnum, T, T1>(TEnum evt, T a0, T1 a1)
+            where TEnum : unmanaged, Enum
+            => EventTrigger(Key(evt), a0, a1);
+
+        public static void EventTrigger<TEnum, T, T1, T2>(TEnum evt, T a0, T1 a1, T2 a2)
+            where TEnum : unmanaged, Enum
+            => EventTrigger(Key(evt), a0, a1, a2);
+
+        // RemoveListener
+        public static IListener RemoveListener<TEnum>(this IListener self, TEnum evt, UnityAction action)
+            where TEnum : unmanaged, Enum
+            => RemoveListener(self, Key(evt), action);
+
+        public static IListener RemoveListener<TEnum, T>(this IListener self, TEnum evt, UnityAction<T> action)
+            where TEnum : unmanaged, Enum
+            => RemoveListener(self, Key(evt), action);
+
+        public static IListener RemoveListener<TEnum, T, T1>(this IListener self, TEnum evt, UnityAction<T, T1> action)
+            where TEnum : unmanaged, Enum
+            => RemoveListener(self, Key(evt), action);
+
+        public static IListener RemoveListener<TEnum, T, T1, T2>(this IListener self, TEnum evt, UnityAction<T, T1, T2> action)
+            where TEnum : unmanaged, Enum
+            => RemoveListener(self, Key(evt), action);
+
+        // AddListener_TR (Query)
+        public static IListener AddListener_TR<TEnum, TResult>(this IListener self, TEnum evt, Func<TResult> func)
+            where TEnum : unmanaged, Enum
+            => AddListener_TR(self, Key(evt), func);
+
+        public static IListener AddListener_TR<TEnum, T, TResult>(this IListener self, TEnum evt, Func<T, TResult> func)
+            where TEnum : unmanaged, Enum
+            => AddListener_TR(self, Key(evt), func);
+
+        public static IListener AddListener_TR<TEnum, T, T1, TResult>(this IListener self, TEnum evt, Func<T, T1, TResult> func)
+            where TEnum : unmanaged, Enum
+            => AddListener_TR(self, Key(evt), func);
+
+        public static IListener AddListener_TR<TEnum, T, T1, T2, TResult>(this IListener self, TEnum evt, Func<T, T1, T2, TResult> func)
+            where TEnum : unmanaged, Enum
+            => AddListener_TR(self, Key(evt), func);
+
+        // EventTrigger_TR (Query)
+        public static TResult EventTrigger_TR<TEnum, TResult>(TEnum evt)
+            where TEnum : unmanaged, Enum
+            => EventTrigger_TR<TResult>(Key(evt));
+        public static TResult EventTrigger_TR<TEnum, T, TResult>(TEnum evt, T a0)
+            where TEnum : unmanaged, Enum
+            => EventTrigger_TR<T, TResult>(Key(evt), a0);
+
+        public static TResult EventTrigger_TR<TEnum, T, T1, TResult>(TEnum evt, T a0, T1 a1)
+            where TEnum : unmanaged, Enum
+            => EventTrigger_TR<T, T1, TResult>(Key(evt), a0, a1);
+
+        public static TResult EventTrigger_TR<TEnum, T, T1, T2, TResult>(TEnum evt, T a0, T1 a1, T2 a2)
+            where TEnum : unmanaged, Enum
+            => EventTrigger_TR<T, T1, T2, TResult>(Key(evt), a0, a1, a2);
+
+        public static TResult EventTrigger_TR<TResult>(EventEnumType evt)=> EventTrigger_TR<TResult>(Key(evt));
+        public static TResult EventTrigger_TR< T, TResult>(EventEnumType evt, T a0) => EventTrigger_TR<T, TResult>(Key(evt), a0);
+        public static TResult EventTrigger_TR<T, T1, TResult>(EventEnumType evt, T a0, T1 a1)=> EventTrigger_TR<T, T1, TResult>(Key(evt), a0, a1);
+        public static TResult EventTrigger_TR< T, T1, T2, TResult>(EventEnumType evt, T a0, T1 a1, T2 a2)=> EventTrigger_TR<T, T1, T2, TResult>(Key(evt), a0, a1, a2);
+
+        // RemoveOne overload (enum)
+        public static IListener RemoveOne_ThisObjListenter<TEnum>(this IListener self, TEnum evt)
+            where TEnum : unmanaged, Enum
+            => RemoveOne_ThisObjListenter(self, Key(evt));
+
+        #endregion
+
+#if UNITY_EDITOR
+        // ================== 统一 Debug 统计（Attempt/Success/Fail + TriggerCount/LastTrigger） ==================
+
+        internal enum DebugTriggerResult
+        {
+            Success = 0,
+            Fail_NotFound = 1,
+            Fail_NullDelegate = 2,
+            Fail_Exception = 3,
+        }
+
+        private struct DebugTriggerStat
+        {
+            public int attempt;
+            public int success;
+            public int fail;
+
+            public int triggerCount;
+            public double lastTriggerTime;
+
+            public double lastAttemptTime;
+            public double lastSuccessTime;
+            public double lastFailTime;
+
+            public DebugTriggerResult lastFailReason;
+            public string lastException;
+        }
+
+        private static readonly Dictionary<string, DebugTriggerStat> _debugTriggerStats = new(256);
+
+        private static double Debug_Now() => EditorApplication.timeSinceStartup;
+
+        internal static void Debug_RecordAttempt(string eventName)
+        {
+            if (string.IsNullOrEmpty(eventName)) return;
+
+            if (!_debugTriggerStats.TryGetValue(eventName, out var s)) s = default;
+            s.attempt++;
+            s.lastAttemptTime = Debug_Now();
+            _debugTriggerStats[eventName] = s;
+        }
+
+        internal static void Debug_RecordSuccess(string eventName)
+        {
+            if (string.IsNullOrEmpty(eventName)) return;
+
+            if (!_debugTriggerStats.TryGetValue(eventName, out var s)) s = default;
+            s.success++;
+            s.triggerCount++;
+
+            var now = Debug_Now();
+            s.lastSuccessTime = now;
+            s.lastTriggerTime = now;
+
+            // ✅ 清掉旧异常信息，避免窗口一直显示旧异常
+            s.lastException = null;
+            s.lastFailReason = DebugTriggerResult.Success;
+
+            _debugTriggerStats[eventName] = s;
+        }
+
+        internal static void Debug_RecordFail(string eventName, DebugTriggerResult reason, Exception ex = null)
+        {
+            if (string.IsNullOrEmpty(eventName)) return;
+
+            if (!_debugTriggerStats.TryGetValue(eventName, out var s)) s = default;
+            s.fail++;
+            s.lastFailTime = Debug_Now();
+            s.lastFailReason = reason;
+
+            if (ex != null)
+            {
+                var msg = ex.GetType().Name + ": " + ex.Message;
+                s.lastException = msg.Length > 200 ? msg.Substring(0, 200) : msg;
+            }
+            else s.lastException = null;
+
+            _debugTriggerStats[eventName] = s;
+        }
+
+        // 给 DebugWindow 用（你窗口里已在用）
+        internal static bool Debug_TryGetTriggerStat(
+            string eventName,
+            out int attempt,
+            out int success,
+            out int fail,
+            out double lastFailTime,
+            out int lastFailReason,
+            out string lastException)
+        {
+            if (_debugTriggerStats.TryGetValue(eventName, out var s))
+            {
+                attempt = s.attempt;
+                success = s.success;
+                fail = s.fail;
+                lastFailTime = s.lastFailTime;
+                lastFailReason = (int)s.lastFailReason;
+                lastException = s.lastException;
+                return true;
+            }
+
+            attempt = success = fail = 0;
+            lastFailTime = 0;
+            lastFailReason = 0;
+            lastException = null;
+            return false;
+        }
+
+        // ================== EDITOR DEBUG API（注册枚举/移除/添加调试监听） ==================
+
+        public readonly struct DebugReg
+        {
+            public readonly string EventName;
+            public readonly string ListenerName;
+            public readonly Type DelegateType;
+            public readonly bool IsTR;
+
+            public DebugReg(string eventName, string listenerName, Type delegateType, bool isTR)
+            {
+                EventName = eventName;
+                ListenerName = listenerName;
+                DelegateType = delegateType;
+                IsTR = isTR;
+            }
+
+            public string DelegateTypeName => DelegateType != null ? DelegateType.Name : "NULL";
+        }
+
+        public static List<DebugReg> Debug_GetAllRegs()
+        {
+            var list = new List<DebugReg>(256);
+            foreach (var kv in _listenerRegs) // listenerName -> set(RegKey)
+            {
+                var listenerName = kv.Key;
+                var set = kv.Value;
+                foreach (var k in set)
+                    list.Add(new DebugReg(k.EventName, listenerName, k.DelegateType, k.IsTR));
+            }
+            return list;
+        }
+
+        public static bool Debug_RemoveOneReg(string eventName, string listenerName, Type delegateType, bool isTR)
+        {
+            if (string.IsNullOrEmpty(eventName) || string.IsNullOrEmpty(listenerName) || delegateType == null)
+                return false;
+
+            var remover = GetRemover(delegateType);
+            if (isTR) remover.RemoveTR(eventName, listenerName);
+            else remover.Remove(eventName, listenerName);
+
+            if (_listenerRegs.TryGetValue(listenerName, out var set))
+            {
+                RegKey toRemove = default;
+                bool found = false;
+
+                foreach (var k in set)
+                {
+                    if (k.EventName == eventName && k.DelegateType == delegateType && k.IsTR == isTR)
+                    {
+                        toRemove = k;
+                        found = true;
+                        break;
+                    }
+                }
+
+                if (found) set.Remove(toRemove);
+                if (set.Count == 0) _listenerRegs.Remove(listenerName);
+            }
+
+            return true;
+        }
+
+        public static int Debug_RemoveListenerFromEvent(string eventName, string listenerName)
+        {
+            if (string.IsNullOrEmpty(eventName) || string.IsNullOrEmpty(listenerName))
+                return 0;
+
+            int removed = 0;
+
+            if (_listenerRegs.TryGetValue(listenerName, out var set))
+            {
+                // 用 List 缓存避免遍历时修改 set
+                var toRemove = new List<RegKey>(8);
+                foreach (var k in set)
+                    if (k.EventName == eventName) toRemove.Add(k);
+
+                for (int i = 0; i < toRemove.Count; i++)
+                {
+                    var k = toRemove[i];
+                    var remover = GetRemover(k.DelegateType);
+                    if (k.IsTR) remover.RemoveTR(k.EventName, listenerName);
+                    else remover.Remove(k.EventName, listenerName);
+
+                    set.Remove(k);
+                    removed++;
+                }
+
+                if (set.Count == 0) _listenerRegs.Remove(listenerName);
+            }
+
+            return removed;
+        }
+
+        public static int Debug_RemoveEvent(string eventName)
+        {
+            if (string.IsNullOrEmpty(eventName)) return 0;
+
+            int removed = 0;
+
+            // 先收集所有关联 listener，避免遍历字典时修改
+            var listeners = new List<string>(64);
+            foreach (var kv in _listenerRegs)
+            {
+                foreach (var k in kv.Value)
+                {
+                    if (k.EventName == eventName)
+                    {
+                        listeners.Add(kv.Key);
+                        break;
+                    }
+                }
+            }
+
+            for (int i = 0; i < listeners.Count; i++)
+                removed += Debug_RemoveListenerFromEvent(eventName, listeners[i]);
+
+            return removed;
+        }
+
+        private sealed class EditorDebugListener : IListener
+        {
+            public string Name;
+            public string ListenerName => Name;
+        }
+
+        private static readonly Dictionary<string, EditorDebugListener> _editorDebugListeners = new();
+
+        public static void Debug_AddLogListener(string eventName, string listenerName, string logPrefix = "[EventCenterDebug]")
+        {
+            if (string.IsNullOrEmpty(eventName)) return;
+            if (string.IsNullOrEmpty(listenerName)) listenerName = $"EditorDebug_{Guid.NewGuid():N}".Substring(0, 16);
+
+            if (!_editorDebugListeners.TryGetValue(listenerName, out var l))
+            {
+                l = new EditorDebugListener { Name = listenerName };
+                _editorDebugListeners.Add(listenerName, l);
+            }
+
+            UnityAction action = () => Debug.Log($"{logPrefix} {eventName} triggered -> {listenerName}");
+            AddCore<UnityAction>(l, eventName, action);
+        }
+#endif
+
+
     }
 }
