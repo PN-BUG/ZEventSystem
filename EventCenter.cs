@@ -27,8 +27,13 @@ namespace ZEventSystem
         {
             get
             {
-                if (this is IOnlyOneID one) return GetType().Name + one.GetID();
-                return GetType().Name;
+                if (this is IOnlyOneID one)
+                    return GetType().Name + "_" + one.GetID();
+
+                if (this is UnityEngine.Object uo)
+                    return GetType().Name + "_" + uo.GetInstanceID();
+
+                return GetType().Name + "_" + GetHashCode();
             }
         }
     }
@@ -1187,7 +1192,5 @@ namespace ZEventSystem
             AddCore<UnityAction>(l, eventName, action);
         }
 #endif
-
-
     }
 }
