@@ -17,8 +17,6 @@ using UnityEditor;
 
 namespace ZEventSystem
 {
-    public interface IEventInfo { }
-
     public interface IOnlyOneID { int Rid { get; set; } }
 
     public interface IListener
@@ -395,10 +393,6 @@ namespace ZEventSystem
 
         #region AddListener (string / IEventInfo type)
 
-        public static IListener AddListener<TEvent>(this IListener self, UnityAction action)
-            where TEvent : IEventInfo
-            => AddListener(self, typeof(TEvent).FullName, action);
-
         public static IListener AddListener(this IListener self, string eventName, UnityAction action)
             => AddCore(self, eventName, action);
 
@@ -414,9 +408,6 @@ namespace ZEventSystem
         #endregion
 
         #region EventTrigger (string / IEventInfo type)
-
-        public static void EventTrigger<TEvent>() where TEvent : IEventInfo
-            => EventTrigger(typeof(TEvent).FullName);
 
 
         public static void EventTrigger(string eventName)
@@ -445,8 +436,9 @@ namespace ZEventSystem
             {
 #if UNITY_EDITOR
                 Debug_RecordFail(eventName, DebugTriggerResult.Fail_Exception, e);
-                Debug.LogException(e);
 #endif
+                Debug.LogException(e);
+                throw;
             }
         }
         public static void EventTrigger<T>(string eventName, T a0)
@@ -475,8 +467,9 @@ namespace ZEventSystem
             {
 #if UNITY_EDITOR
                 Debug_RecordFail(eventName, DebugTriggerResult.Fail_Exception, e);
-                Debug.LogException(e);
 #endif
+                Debug.LogException(e);
+                throw;
             }
         }
 
@@ -506,8 +499,9 @@ namespace ZEventSystem
             {
 #if UNITY_EDITOR
                 Debug_RecordFail(eventName, DebugTriggerResult.Fail_Exception, e);
-                Debug.LogException(e);
 #endif
+                Debug.LogException(e);
+                throw;
             }
         }
 
@@ -537,8 +531,9 @@ namespace ZEventSystem
             {
 #if UNITY_EDITOR
                 Debug_RecordFail(eventName, DebugTriggerResult.Fail_Exception, e);
-                Debug.LogException(e);
 #endif
+                Debug.LogException(e);
+                throw;
             }
         }
 
@@ -610,9 +605,9 @@ namespace ZEventSystem
             {
 #if UNITY_EDITOR
                 Debug_RecordFail(eventName, DebugTriggerResult.Fail_Exception, e);
-                Debug.LogException(e);
 #endif
-                return default;
+                Debug.LogException(e);
+                throw;
             }
         }
 
