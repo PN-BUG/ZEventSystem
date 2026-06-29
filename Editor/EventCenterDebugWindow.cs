@@ -132,7 +132,7 @@ namespace ZEventSystem.Editor
             if (_icInfo.image == null) _icInfo = EditorGUIUtility.IconContent("d_console.infoicon", "信息");
         }
 
-        [MenuItem("Tools/ZEventSystem/事件中心调试窗口")]
+        [MenuItem("UnityFramework/ZEventSystem/事件中心调试窗口")]
         public static void Open()
         {
             var w = GetWindow<EventCenterDebugWindow>("事件中心调试");
